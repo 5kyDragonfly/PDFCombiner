@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
 ui.py – Streamlit front-end for PDFCombiner
-• Drag-and-drop or browse to add PDFs
-• Inline PDF preview
-• ← / → buttons to reorder, ✖ to remove
-• “Combine PDFs” writes combined.pdf and offers a download
+• Upload PDFs, reorder with ↑ / ↓, remove with ✖
+• “Combine PDFs” calls combiner.combine_pdfs()
+• Combined file is saved to Downloads; UI shows path + (Windows) folder link
 """
 
 from __future__ import annotations
-import base64, io, os, tempfile
+import os, tempfile
 from pathlib import Path
 
 import streamlit as st
-from pypdf import PdfReader, PdfWriter
+import combiner  # combiner.py must be in the same directory
 
 
 # ---------- helpers -------------------------------------------------
+def _rerun() -> None:
+    """Streamlit changed API: st.rerun() ≥1.25, st.experimental_rerun() before."""
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()  # type: ignore[attr-defined]
+
+
 def _init_state() -> None:
     if "files" not in st.session_state:
-        st.session_state.files: list[dict] = []  # {name,data,key}
+        st.session_state.files = []  # type: list[dict]  # each dict: {name, data, key}
 
 
 def _add_uploads(uploaded) -> None:
@@ -27,23 +34,7 @@ def _add_uploads(uploaded) -> None:
         # dedupe on name + size
         if any(f["name"] == up.name and len(f["data"]) == len(data) for f in st.session_state.files):
             continue
-        st.session_state.files.append(
-            {"name": up.name, "data": data, "key": f"{up.name}-{len(data)}"}
-        )
-
-
-def _pdf_pages(data: bytes) -> int:
-    try:
-        return len(PdfReader(io.BytesIO(data)).pages)
-    except Exception:
-        return 0
-
-
-def _pdf_preview(data: bytes, height: int = 240, **kwargs) -> None:
-    """Embed a PDF via data URL. Extra kwargs are passed to Streamlit HTML component."""
-    b64 = base64.b64encode(data).decode()
-    html = f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="{height}"></iframe>'
-    st.components.v1.html(html, height=height + 6, **kwargs)
+        st.session_state.files.append({"name": up.name, "data": data, "key": f"{up.name}-{len(data)}"})
 
 
 def _move(idx: int, delta: int) -> None:
@@ -55,23 +46,9 @@ def _move(idx: int, delta: int) -> None:
         )
 
 
-def _combine(files: list[dict]) -> bytes:
-    writer, added = PdfWriter(), 0
-    for f in files:
-        reader = PdfReader(io.BytesIO(f["data"]))
-        for p in reader.pages:
-            writer.add_page(p)
-        added += 1
-    buf = io.BytesIO()
-    writer.write(buf)
-    writer.close()
-    buf.seek(0)
-    return buf.read() if added else b""
-
-
-def _dl_path() -> Path:
+def _downloads_path() -> Path:
     if os.name == "nt":
-        return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Downloads"
+        return Path(os.environ.get("USERPROFILE", Path.home())) / "Downloads"
     return Path.home() / "Downloads"
 
 
@@ -81,57 +58,47 @@ _init_state()
 
 st.title("PDF Combiner")
 
-# top bar
-combine_now = st.button("Combine PDFs", type="primary")
-st.caption("Add PDFs, set the order, then click **Combine PDFs**.")
+combine_clicked = st.button("Combine PDFs", type="primary")
+st.caption("Upload PDFs below, reorder them with the arrows, then click Combine PDFs.")
 
-# uploader
 uploads = st.file_uploader(
-    "Drop PDF files here or click to browse",
+    "Drag & drop PDFs here or click to browse",
     type=["pdf"],
     accept_multiple_files=True,
 )
 if uploads:
     _add_uploads(uploads)
 
-# list with controls & preview (wrapped in placeholder)
-placeholder = st.empty()
-with placeholder.container():
-    for i, f in enumerate(list(st.session_state.files)):  # copy so index stable
-        with st.container(border=True):
-            cols = st.columns([5, 1, 1, 1])
-            cols[0].markdown(f"**{f['name']}** ({_pdf_pages(f['data'])} pg)")
-            if cols[1].button("←", key=f"left-{f['key']}"):
-                _move(i, -1)
-                st.experimental_rerun()
-            if cols[2].button("→", key=f"right-{f['key']}"):
-                _move(i, 1)
-                st.experimental_rerun()
-            if cols[3].button("✖", key=f"del-{f['key']}"):
-                st.session_state.files.pop(i)
-                st.experimental_rerun()
-            _pdf_preview(f["data"], key=f"prev-{f['key']}")  # unique key per preview
+# list view with ↑ ↓ ✖
+for i, f in enumerate(list(st.session_state.files)):
+    cols = st.columns([5, 1, 1, 1])
+    cols[0].markdown(f"**{f['name']}**")
+    if cols[1].button("↑", key=f"up-{f['key']}"):
+        _move(i, -1)
+        _rerun()
+    if cols[2].button("↓", key=f"down-{f['key']}"):
+        _move(i, +1)
+        _rerun()
+    if cols[3].button("✖", key=f"del-{f['key']}"):
+        st.session_state.files.pop(i)
+        _rerun()
 
 # combine action
-if combine_now:
+if combine_clicked:
     if not st.session_state.files:
         st.warning("No PDFs selected.")
     else:
-        pdf_bytes = _combine(st.session_state.files)
-        if not pdf_bytes:
-            st.error("Merge failed.")
-        else:
-            st.success("Combined PDF ready!")
-            st.download_button(
-                label="Download combined.pdf",
-                data=pdf_bytes,
-                file_name="combined.pdf",
-                mime="application/pdf",
-            )
-            # local dev: also write to Downloads
-            try:
-                local = _dl_path() / "combined.pdf"
-                local.write_bytes(pdf_bytes)
-                st.caption(f"Saved a copy to **{local}**")
-            except Exception:
-                pass
+        tmpdir = tempfile.mkdtemp()
+        folder = Path(tmpdir)
+        for it in st.session_state.files:
+            (folder / it["name"]).write_bytes(it["data"])
+
+        names = [it["name"] for it in st.session_state.files]
+
+        try:
+            out_path = combiner.combine_pdfs(folder, names, output_filename="combined.pdf")
+            st.success(f"Combined PDF saved to: `{out_path}`")
+            if os.name == "nt":
+                st.markdown(f"[Open Downloads folder](file:///{out_path.parent})")
+        except Exception as e:
+            st.error(f"Merge failed: {e}")
