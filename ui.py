@@ -1,37 +1,36 @@
 #!/usr/bin/env python3
 """
-ui.py – Streamlit front-end for PDFCombiner
-• Upload PDFs, reorder with ↑ / ↓, remove with ✖
-• “Combine PDFs” calls combiner.combine_pdfs()
-• Combined file is saved to Downloads; UI shows path + (Windows) folder link
+ui.py – PDF Combiner front-end
+• Upload PDFs
+• Custom list with ↑ / ↓ / ✖
+• Combines via combiner.combine_pdfs()
+• Saves to Downloads + toast notification
 """
 
 from __future__ import annotations
-import os, tempfile
+import os, platform, tempfile
 from pathlib import Path
 
 import streamlit as st
-import combiner  # combiner.py must be in the same directory
+import combiner  # combiner.py in the same folder
 
 
-# ---------- helpers -------------------------------------------------
+# ---------- helpers ----------
 def _rerun() -> None:
-    """Streamlit changed API: st.rerun() ≥1.25, st.experimental_rerun() before."""
     if hasattr(st, "rerun"):
         st.rerun()
     else:
-        st.experimental_rerun()  # type: ignore[attr-defined]
+        st.experimental_rerun()  # pragma: no cover
 
 
 def _init_state() -> None:
     if "files" not in st.session_state:
-        st.session_state.files = []  # type: list[dict]  # each dict: {name, data, key}
+        st.session_state.files = []  # type: list[dict]  # {name, data, key}
 
 
 def _add_uploads(uploaded) -> None:
     for up in uploaded:
         data = up.read()
-        # dedupe on name + size
         if any(f["name"] == up.name and len(f["data"]) == len(data) for f in st.session_state.files):
             continue
         st.session_state.files.append({"name": up.name, "data": data, "key": f"{up.name}-{len(data)}"})
@@ -52,26 +51,62 @@ def _downloads_path() -> Path:
     return Path.home() / "Downloads"
 
 
-# ---------- UI ------------------------------------------------------
+def _open_folder(path: Path) -> None:
+    """Try to open the folder in the local file explorer (no-op on Streamlit Cloud)."""
+    try:
+        if os.name == "nt":
+            os.startfile(str(path))
+        elif platform.system() == "Darwin":
+            os.system(f"open {path}")
+        elif platform.system() == "Linux":
+            os.system(f"xdg-open {path}")
+    except Exception:
+        pass  # ignore silently
+
+
+# ---------- UI ----------
 st.set_page_config(page_title="PDF Combiner", layout="wide")
 _init_state()
+
+# Hide the default uploader preview to avoid duplicate rows
+st.markdown(
+    """
+    <style>
+    /* 1️⃣ Hide <ul> list + its <li> rows */
+    div[data-testid="stFileUploader"] ul {display:none !important;}
+
+    /* 2️⃣ Hide "Showing page X of Y" footer + pagination arrows */
+    div[data-testid="stFileUploader"] button[data-testid="file-uploader-pagination-next"],
+    div[data-testid="stFileUploader"] button[data-testid="file-uploader-pagination-prev"],
+    div[data-testid="stFileUploader"] span[data-testid="file-uploader-pagination"] {
+        display:none !important;
+    }
+
+    /* 3️⃣ Remove extra margin the list leaves behind */
+    div[data-testid="stFileUploader"] > section > div:first-child {
+        margin-bottom:0 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.title("PDF Combiner")
 
 combine_clicked = st.button("Combine PDFs", type="primary")
-st.caption("Upload PDFs below, reorder them with the arrows, then click Combine PDFs.")
+st.caption("Upload PDFs, reorder with ↑ / ↓, remove with ✖, then click Combine.")
 
 uploads = st.file_uploader(
-    "Drag & drop PDFs here or click to browse",
+    "Drag & drop PDFs here or click Browse",
     type=["pdf"],
     accept_multiple_files=True,
 )
 if uploads:
     _add_uploads(uploads)
 
-# list view with ↑ ↓ ✖
+# custom list
 for i, f in enumerate(list(st.session_state.files)):
-    cols = st.columns([5, 1, 1, 1])
+    cols = st.columns([6, 1, 1, 1])
     cols[0].markdown(f"**{f['name']}**")
     if cols[1].button("↑", key=f"up-{f['key']}"):
         _move(i, -1)
@@ -92,13 +127,13 @@ if combine_clicked:
         folder = Path(tmpdir)
         for it in st.session_state.files:
             (folder / it["name"]).write_bytes(it["data"])
-
         names = [it["name"] for it in st.session_state.files]
 
         try:
-            out_path = combiner.combine_pdfs(folder, names, output_filename="combined.pdf")
-            st.success(f"Combined PDF saved to: `{out_path}`")
-            if os.name == "nt":
-                st.markdown(f"[Open Downloads folder](file:///{out_path.parent})")
+            out_path = combiner.combine_pdfs(folder, names, "combined.pdf")
+            st.toast("Combined PDF saved to Downloads 📁", icon="✅")
+            # Button to open folder (works only on local desktop)
+            if st.button("Open Downloads folder"):
+                _open_folder(out_path.parent)
         except Exception as e:
-            st.error(f"Merge failed: {e}")
+            st.toast(f"Merge failed: {e}", icon="❌")
