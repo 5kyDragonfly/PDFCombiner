@@ -3,56 +3,57 @@
 ui.py – PDF Combiner front-end
 • Upload PDFs
 • Custom list with ↑ / ↓ / ✖
-• Combines via combiner.combine_pdfs()
-• Saves to Downloads + toast notification
+• Combine → saves to Downloads, shows toast, optional “Open folder” (local)
 """
 
 from __future__ import annotations
-import os, platform, tempfile
+import os, platform, tempfile, logging
 from pathlib import Path
 
 import streamlit as st
-import combiner  # combiner.py in the same folder
+import combiner          # combiner.py must be in the same folder
+
+logging.basicConfig(level=logging.INFO)
+DEBUG = False            # flip to True for sidebar debug
 
 
-# ---------- helpers ----------
+# ───────────────────────────────── helpers ──────────────────────────
 def _rerun() -> None:
     if hasattr(st, "rerun"):
         st.rerun()
     else:
-        st.experimental_rerun()  # pragma: no cover
+        st.experimental_rerun()            # for Streamlit < 1.25
 
 
 def _init_state() -> None:
-    if "files" not in st.session_state:
-        st.session_state.files = []  # type: list[dict]  # {name, data, key}
+    if "files" not in st.session_state:    # our working list
+        st.session_state.files: list[dict] = []
+    if "uploader_key" not in st.session_state:  # forces uploader reset
+        st.session_state.uploader_key = 0
 
 
 def _add_uploads(uploaded) -> None:
+    """Append new uploads to session list (dedup by name+size)."""
     for up in uploaded:
         data = up.read()
-        if any(f["name"] == up.name and len(f["data"]) == len(data) for f in st.session_state.files):
+        if any(f["name"] == up.name and len(f["data"]) == len(data)
+               for f in st.session_state.files):
             continue
-        st.session_state.files.append({"name": up.name, "data": data, "key": f"{up.name}-{len(data)}"})
+        key = f"{up.name}-{len(data)}"
+        st.session_state.files.append({"name": up.name, "data": data, "key": key})
+        logging.info("Added %s", up.name)
 
 
 def _move(idx: int, delta: int) -> None:
     j = idx + delta
     if 0 <= j < len(st.session_state.files):
         st.session_state.files[idx], st.session_state.files[j] = (
-            st.session_state.files[j],
-            st.session_state.files[idx],
+            st.session_state.files[j], st.session_state.files[idx]
         )
-
-
-def _downloads_path() -> Path:
-    if os.name == "nt":
-        return Path(os.environ.get("USERPROFILE", Path.home())) / "Downloads"
-    return Path.home() / "Downloads"
+        logging.info("Moved %s to pos %d", st.session_state.files[j]["name"], j)
 
 
 def _open_folder(path: Path) -> None:
-    """Try to open the folder in the local file explorer (no-op on Streamlit Cloud)."""
     try:
         if os.name == "nt":
             os.startfile(str(path))
@@ -61,28 +62,23 @@ def _open_folder(path: Path) -> None:
         elif platform.system() == "Linux":
             os.system(f"xdg-open {path}")
     except Exception:
-        pass  # ignore silently
+        pass
 
 
-# ---------- UI ----------
+# ───────────────────────────────── UI ───────────────────────────────
 st.set_page_config(page_title="PDF Combiner", layout="wide")
 _init_state()
 
-# Hide the default uploader preview to avoid duplicate rows
+# Hide Streamlit’s internal file list + footer
 st.markdown(
     """
     <style>
-    /* 1️⃣ Hide <ul> list + its <li> rows */
     div[data-testid="stFileUploader"] ul {display:none !important;}
-
-    /* 2️⃣ Hide "Showing page X of Y" footer + pagination arrows */
     div[data-testid="stFileUploader"] button[data-testid="file-uploader-pagination-next"],
     div[data-testid="stFileUploader"] button[data-testid="file-uploader-pagination-prev"],
     div[data-testid="stFileUploader"] span[data-testid="file-uploader-pagination"] {
         display:none !important;
     }
-
-    /* 3️⃣ Remove extra margin the list leaves behind */
     div[data-testid="stFileUploader"] > section > div:first-child {
         margin-bottom:0 !important;
     }
@@ -100,40 +96,47 @@ uploads = st.file_uploader(
     "Drag & drop PDFs here or click Browse",
     type=["pdf"],
     accept_multiple_files=True,
+    key=f"uploader-{st.session_state.uploader_key}",    # dynamic key!
 )
 if uploads:
     _add_uploads(uploads)
 
 # custom list
-for i, f in enumerate(list(st.session_state.files)):
-    cols = st.columns([6, 1, 1, 1])
-    cols[0].markdown(f"**{f['name']}**")
-    if cols[1].button("↑", key=f"up-{f['key']}"):
-        _move(i, -1)
+for i, f in enumerate(list(st.session_state.files)):   # copy keeps index stable
+    c1, c2, c3, c4 = st.columns([6, 1, 1, 1])
+    c1.markdown(f"**{f['name']}**")
+    if c2.button("↑", key=f"up-{f['key']}"):
+        _move(i, -1); _rerun()
+    if c3.button("↓", key=f"down-{f['key']}"):
+        _move(i, +1); _rerun()
+    if c4.button("✖", key=f"del-{f['key']}"):
+        # remove file, then reset uploader widget so it doesn't re-add it
+        st.session_state.files = [x for x in st.session_state.files if x["key"] != f["key"]]
+        st.session_state.uploader_key += 1
+        logging.info("Deleted %s", f["name"])
         _rerun()
-    if cols[2].button("↓", key=f"down-{f['key']}"):
-        _move(i, +1)
-        _rerun()
-    if cols[3].button("✖", key=f"del-{f['key']}"):
-        st.session_state.files.pop(i)
-        _rerun()
+
+# debug panel
+if DEBUG:
+    with st.sidebar.expander("Session state"):
+        st.json(st.session_state.files)
 
 # combine action
 if combine_clicked:
     if not st.session_state.files:
         st.warning("No PDFs selected.")
     else:
-        tmpdir = tempfile.mkdtemp()
-        folder = Path(tmpdir)
+        tmpdir = Path(tempfile.mkdtemp())
         for it in st.session_state.files:
-            (folder / it["name"]).write_bytes(it["data"])
-        names = [it["name"] for it in st.session_state.files]
+            (tmpdir / it["name"]).write_bytes(it["data"])
+        order = [it["name"] for it in st.session_state.files]
 
         try:
-            out_path = combiner.combine_pdfs(folder, names, "combined.pdf")
+            out_path = combiner.combine_pdfs(tmpdir, order, "combined.pdf")
             st.toast("Combined PDF saved to Downloads 📁", icon="✅")
-            # Button to open folder (works only on local desktop)
+            st.session_state.uploader_key += 1         # clear uploader for next batch
             if st.button("Open Downloads folder"):
                 _open_folder(out_path.parent)
         except Exception as e:
             st.toast(f"Merge failed: {e}", icon="❌")
+            logging.exception("Merge failed")
